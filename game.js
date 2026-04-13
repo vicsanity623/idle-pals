@@ -1,640 +1,601 @@
 /**
- * SOTA Idle RPG - Red/Blue Edition
- * A fully autonomous, infinite progression HTML5 Canvas Game.
+ * Idle Pal RPG - Endless Adventure Engine
+ * Procedural infinite map, analog controls, manual combat, visual enhancements.
  */
 
-// --- ENUMS & CONSTANTS ---
-const TILE_SIZE = 40;
-const MAP_WIDTH = 15;
-const MAP_HEIGHT = 15;
-const GAME_STATES = { WANDERING: 0, BATTLING: 1, CAPTURING: 2 };
-const TYPES = ['Grass', 'Fire', 'Water'];
-const TYPE_COLORS = { 'Grass': '#44ff44', 'Fire': '#ff4444', 'Water': '#4444ff' };
-
+// --- CONFIG & STATE ---
+const TILE_SIZE = 50;
+const STATES = { WANDERING: 0, BATTLING: 1, MENU: 2 };
+const TYPES = {
+    'Grass': { color: '#66BB6A', weak: 'Fire', strong: 'Water' },
+    'Fire':  { color: '#EF5350', weak: 'Water', strong: 'Grass' },
+    'Water': { color: '#42A5F5', weak: 'Grass', strong: 'Fire' }
+};
 const PAL_NAMES = {
-    'Grass': ['LeafSaur', 'VineSnake', 'MossTurtle', 'RootDog'],
-    'Fire': ['EmberTail', 'FlameBat', 'AshBird', 'LavaCat'],
-    'Water': ['AquaTurtle', 'TideFish', 'ShellCrab', 'WaveSeal']
+    'Grass': ['LeafSaur', 'MossFox', 'VineSnake', 'PetalBear'],
+    'Fire':  ['EmberTail', 'FlamePup', 'AshBird', 'LavaToad'],
+    'Water': ['AquaTurtle', 'TideSeal', 'ShellCrab', 'WaveDolphin']
 };
 
-// --- GAME STATE ---
 let state = {
     lastSave: Date.now(),
-    zone: 1,
-    killsInZone: 0,
-    gold: 0,
-    badges: 0,
-    pals: [],
-    activePalIndex: 0,
-    upgrades: {
-        catchRate: 0, // Increases catch chance
-        speed: 0,     // Player movement speed
-        heal: 0       // Out of combat heal rate
-    }
+    gold: 0, badges: 0, stones: 0, maxLevelReached: 1,
+    pals: [], activePalIndex: 0,
+    upgrades: { catchRate: 0, speed: 0, heal: 0 }
 };
 
-let gameEngine = {
-    currentState: GAME_STATES.WANDERING,
-    map: [],
-    player: { x: 7, y: 7, targetX: 7, targetY: 7, moving: false, pixelsToMove: 0, dir: 'down' },
+let engine = {
+    state: STATES.WANDERING,
+    camX: 0, camY: 0,
+    player: { x: 10, y: 10, vx: 0, vy: 0, radius: 15 },
     wildPal: null,
-    battleTimer: 0,
+    itemsMap: new Map(), // spatial hash for dynamic items
+    particles: [],
     floatingTexts: [],
-    logs: []
+    time: 0,
+    joystick: { active: false, id: null, originX: 0, originY: 0, dx: 0, dy: 0 },
+    battleCooldown: false
 };
 
-// --- UTILITIES ---
-const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-const getCost = (base, lvl, mult) => Math.floor(base * Math.pow(mult, lvl));
+// --- PROCEDURAL GENERATION (Value Noise) ---
+function hash(x, y) {
+    let h = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+    return h - Math.floor(h);
+}
+function noise(x, y) {
+    let ix = Math.floor(x), iy = Math.floor(y);
+    let fx = x - ix, fy = y - iy;
+    let v1 = hash(ix, iy), v2 = hash(ix + 1, iy);
+    let v3 = hash(ix, iy + 1), v4 = hash(ix + 1, iy + 1);
+    let i1 = v1 * (1 - fx) + v2 * fx;
+    let i2 = v3 * (1 - fx) + v4 * fx;
+    return i1 * (1 - fy) + i2 * fy;
+}
+function getTile(tx, ty) {
+    let n = noise(tx * 0.15, ty * 0.15);
+    // 0: Path, 1: Grass, 2: Water, 3: Tree
+    if (n < 0.25) return 2; // Water
+    if (n < 0.50) return 0; // Path
+    if (n < 0.75) return 1; // Grass
+    return 3; // Tree
+}
 
-// --- PAL GENERATOR ---
+// Item Discovery
+function checkTileItem(tx, ty) {
+    let key = `${tx},${ty}`;
+    if (!engine.itemsMap.has(key)) {
+        // 1% chance for an Evo Stone to spawn on newly discovered Path/Grass
+        let t = getTile(tx, ty);
+        if ((t === 0 || t === 1) && hash(tx * 3.1, ty * 7.2) < 0.01) {
+            engine.itemsMap.set(key, { type: 'stone', collected: false });
+        } else {
+            engine.itemsMap.set(key, { type: 'none' }); // mark searched
+        }
+    }
+    let item = engine.itemsMap.get(key);
+    if (item && item.type === 'stone' && !item.collected) {
+        item.collected = true;
+        state.stones++;
+        spawnParticles(tx*TILE_SIZE + 25, ty*TILE_SIZE + 25, '#9C27B0', 10);
+        addFloatingText(300, 250, "+1 Evo Stone!", '#E040FB');
+        updateUI();
+    }
+}
+
+// --- ENTITIES & MECHANICS ---
 function generatePal(level, isStarter = false) {
-    const type = TYPES[rand(0, 2)];
-    const name = PAL_NAMES[type][rand(0, PAL_NAMES[type].length - 1)];
-    // Base stats scale with level exponentially for infinite scaling
-    const scale = Math.pow(1.15, level - 1); 
-    const badgeMult = 1 + (state.badges * 1); // +100% per badge
+    const typesArr = Object.keys(TYPES);
+    const type = typesArr[Math.floor(Math.random() * typesArr.length)];
+    const name = PAL_NAMES[type][Math.floor(Math.random() * PAL_NAMES[type].length)];
+    const badgeMult = 1 + (state.badges * 0.5); 
     
     return {
-        id: Date.now() + rand(0, 1000),
+        id: Date.now() + Math.random(),
         name: isStarter ? "Starter " + name : name,
         type: type,
         level: level,
-        exp: 0,
-        maxExp: Math.floor(100 * Math.pow(1.1, level)),
-        hp: Math.floor(50 * scale * badgeMult),
-        maxHp: Math.floor(50 * scale * badgeMult),
-        atk: Math.floor(10 * scale * badgeMult),
-        def: Math.floor(5 * scale * badgeMult)
+        exp: 0, maxExp: Math.floor(100 * Math.pow(1.1, level)),
+        hp: Math.floor(50 * Math.pow(1.1, level) * badgeMult),
+        maxHp: Math.floor(50 * Math.pow(1.1, level) * badgeMult),
+        atk: Math.floor(10 * Math.pow(1.1, level) * badgeMult),
+        def: Math.floor(5 * Math.pow(1.1, level) * badgeMult),
+        evo: 0
     };
 }
 
-// --- MAP GENERATION ---
-// 0: Path, 1: Grass, 2: Obstacle/Tree
-function generateMap() {
-    gameEngine.map = [];
-    for (let y = 0; y < MAP_HEIGHT; y++) {
-        let row = [];
-        for (let x = 0; x < MAP_WIDTH; x++) {
-            if (x === 0 || y === 0 || x === MAP_WIDTH - 1 || y === MAP_HEIGHT - 1) {
-                row.push(2); // Border trees
-            } else {
-                // 30% grass, 10% obstacle, 60% path
-                let r = Math.random();
-                if (r < 0.3 && (x !== 7 || y !== 7)) row.push(1);
-                else if (r < 0.4 && (x !== 7 || y !== 7)) row.push(2);
-                else row.push(0);
-            }
-        }
-        gameEngine.map.push(row);
+function evolvePal(pal) {
+    if (state.stones >= 3) {
+        state.stones -= 3;
+        pal.evo++;
+        pal.name = "Super " + pal.name.replace("Starter ", "").replace("Super ", "");
+        pal.maxHp *= 2; pal.hp = pal.maxHp;
+        pal.atk *= 2; pal.def *= 2;
+        addFloatingText(300, 200, "EVOLVED!", '#E040FB');
+        updateUI();
+        saveGame();
     }
-}
-
-// --- SAVE / LOAD / OFFLINE ---
-function saveGame() {
-    state.lastSave = Date.now();
-    localStorage.setItem('idlePalSave', JSON.stringify(state));
-}
-
-function loadGame() {
-    const saved = localStorage.getItem('idlePalSave');
-    if (saved) {
-        let parsed = JSON.parse(saved);
-        state = { ...state, ...parsed };
-        
-        // Handle backwards compatibility of upgrades object
-        if(!state.upgrades) state.upgrades = { catchRate:0, speed:0, heal:0 };
-        
-        calculateOfflineProgress();
-    } else {
-        // First play
-        state.pals.push(generatePal(1, true));
-    }
-    updateUI();
-}
-
-function calculateOfflineProgress() {
-    const now = Date.now();
-    const diffMs = now - state.lastSave;
-    const diffSec = Math.floor(diffMs / 1000);
-    
-    if (diffSec > 60) { // More than 1 minute offline
-        const active = state.pals[state.activePalIndex];
-        
-        // Rough estimate: A battle takes ~3 seconds of idle time.
-        // We only simulate wins based on if player out-levels or out-stats the zone roughly.
-        // For simplicity in infinite scaling, assume 1 win every 5 seconds.
-        const simulatedBattles = Math.floor(diffSec / 5);
-        const goldEarned = simulatedBattles * Math.floor(10 * Math.pow(1.1, state.zone) * (1 + state.badges * 0.5));
-        const xpEarned = simulatedBattles * Math.floor(20 * Math.pow(1.15, state.zone));
-
-        state.gold += goldEarned;
-        active.exp += xpEarned;
-        checkLevelUp(active);
-
-        // Show offline modal
-        document.getElementById('offline-time').innerText = formatTime(diffSec);
-        document.getElementById('offline-battles').innerText = simulatedBattles;
-        document.getElementById('offline-gold').innerText = goldEarned;
-        document.getElementById('offline-xp').innerText = xpEarned;
-        document.getElementById('offline-modal').classList.remove('hidden');
-    }
-}
-
-function formatTime(sec) {
-    let h = Math.floor(sec / 3600);
-    let m = Math.floor((sec % 3600) / 60);
-    return `${h}h ${m}m`;
-}
-
-function hardReset() {
-    if(confirm("Are you sure? This deletes ALL progress!")) {
-        localStorage.removeItem('idlePalSave');
-        location.reload();
-    }
-}
-
-function prestige() {
-    if (state.zone < 10) return alert("Reach Zone 10 to prestige!");
-    const badgesEarned = Math.floor(state.zone / 5);
-    state.badges += badgesEarned;
-    state.zone = 1;
-    state.gold = 0;
-    state.killsInZone = 0;
-    state.upgrades = { catchRate:0, speed:0, heal:0 };
-    state.pals = [generatePal(1, true)];
-    state.activePalIndex = 0;
-    saveGame();
-    generateMap();
-    updateUI();
-    logAction(`Prestiged! Gained ${badgesEarned} Badges.`);
-}
-
-// --- COMBAT & MECHANICS ---
-function logAction(msg) {
-    const logDiv = document.getElementById('action-log');
-    const entry = document.createElement('div');
-    entry.className = 'log-entry';
-    entry.innerText = msg;
-    logDiv.appendChild(entry);
-    if (logDiv.children.length > 5) logDiv.firstChild.remove();
-}
-
-function addFloatingText(x, y, text, color) {
-    gameEngine.floatingTexts.push({ x, y, text, color, life: 1.0 });
 }
 
 function checkLevelUp(pal) {
     while (pal.exp >= pal.maxExp) {
         pal.exp -= pal.maxExp;
         pal.level++;
+        if(pal.level > state.maxLevelReached) state.maxLevelReached = pal.level;
         pal.maxExp = Math.floor(100 * Math.pow(1.1, pal.level));
-        
-        // Recalculate stats based on level, heal to full
-        const scale = Math.pow(1.15, pal.level - 1);
-        const badgeMult = 1 + (state.badges * 1);
-        
-        pal.maxHp = Math.floor(50 * scale * badgeMult);
-        pal.hp = pal.maxHp;
-        pal.atk = Math.floor(10 * scale * badgeMult);
-        pal.def = Math.floor(5 * scale * badgeMult);
-        
-        logAction(`${pal.name} grew to Lvl ${pal.level}!`);
+        let scale = Math.pow(1.1, pal.level) * Math.pow(2, pal.evo) * (1 + state.badges * 0.5);
+        pal.maxHp = Math.floor(50 * scale); pal.hp = pal.maxHp;
+        pal.atk = Math.floor(10 * scale);
+        pal.def = Math.floor(5 * scale);
+        logAction(`${pal.name} reached Lvl ${pal.level}!`);
     }
 }
 
-function getDamage(attacker, defender) {
-    let typeMult = 1.0;
-    if (attacker.type === 'Water' && defender.type === 'Fire') typeMult = 1.5;
-    if (attacker.type === 'Fire' && defender.type === 'Grass') typeMult = 1.5;
-    if (attacker.type === 'Grass' && defender.type === 'Water') typeMult = 1.5;
-    
-    if (attacker.type === 'Fire' && defender.type === 'Water') typeMult = 0.5;
-    if (attacker.type === 'Grass' && defender.type === 'Fire') typeMult = 0.5;
-    if (attacker.type === 'Water' && defender.type === 'Grass') typeMult = 0.5;
-
-    let dmg = Math.floor((attacker.atk * typeMult) - (defender.def * 0.5));
-    if (dmg < 1) dmg = 1;
-    return { dmg, typeMult };
+// --- SAVE / OFFLINE ---
+function saveGame() {
+    state.lastSave = Date.now();
+    localStorage.setItem('idlePalEndless', JSON.stringify(state));
+}
+function loadGame() {
+    let saved = localStorage.getItem('idlePalEndless');
+    if (saved) {
+        state = { ...state, ...JSON.parse(saved) };
+        if(!state.stones) state.stones = 0;
+        if(!state.maxLevelReached) state.maxLevelReached = 1;
+        calcOffline();
+    } else {
+        state.pals.push(generatePal(1, true));
+    }
+    updateUI();
+}
+function calcOffline() {
+    let diff = Math.floor((Date.now() - state.lastSave) / 1000);
+    if (diff > 60) {
+        let active = state.pals[state.activePalIndex];
+        let simBattles = Math.floor(diff / 10);
+        let goldGain = simBattles * Math.floor(5 * active.level);
+        let xpGain = simBattles * Math.floor(15 * active.level);
+        state.gold += goldGain;
+        active.exp += xpGain;
+        checkLevelUp(active);
+        
+        document.getElementById('offline-time').innerText = `${Math.floor(diff/3600)}h ${Math.floor((diff%3600)/60)}m`;
+        document.getElementById('offline-gold').innerText = goldGain;
+        document.getElementById('offline-xp').innerText = xpGain;
+        document.getElementById('offline-modal').classList.remove('hidden');
+    }
 }
 
+// --- INPUT & CONTROLS ---
+const joyZone = document.getElementById('joystick-zone');
+const joyBase = document.getElementById('joystick-base');
+const joyKnob = document.getElementById('joystick-knob');
+const joyHint = document.getElementById('joystick-hint');
+
+function handleJoyStart(e) {
+    if(engine.state !== STATES.WANDERING) return;
+    let touch = e.touches ? e.touches[0] : e;
+    engine.joystick.active = true;
+    engine.joystick.id = e.touches ? touch.identifier : 'mouse';
+    engine.joystick.originX = touch.clientX;
+    engine.joystick.originY = touch.clientY;
+    
+    joyBase.classList.remove('hidden');
+    joyBase.style.left = touch.clientX + 'px';
+    joyBase.style.top = touch.clientY + 'px';
+    joyKnob.style.transform = `translate(-50%, -50%)`;
+    joyHint.classList.add('hidden');
+}
+function handleJoyMove(e) {
+    if(!engine.joystick.active || engine.state !== STATES.WANDERING) return;
+    let touch = e.touches ? Array.from(e.touches).find(t => t.identifier === engine.joystick.id) : e;
+    if(!touch) return;
+    
+    let dx = touch.clientX - engine.joystick.originX;
+    let dy = touch.clientY - engine.joystick.originY;
+    let dist = Math.sqrt(dx*dx + dy*dy);
+    let maxDist = 40;
+    
+    if(dist > maxDist) { dx = (dx/dist)*maxDist; dy = (dy/dist)*maxDist; }
+    
+    joyKnob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+    
+    // Normalize for game velocity (-1 to 1)
+    engine.joystick.dx = dx / maxDist;
+    engine.joystick.dy = dy / maxDist;
+}
+function handleJoyEnd(e) {
+    if(e.touches) {
+        let touch = Array.from(e.changedTouches).find(t => t.identifier === engine.joystick.id);
+        if(!touch) return;
+    }
+    engine.joystick.active = false;
+    engine.joystick.dx = 0; engine.joystick.dy = 0;
+    joyBase.classList.add('hidden');
+}
+
+joyZone.addEventListener('mousedown', handleJoyStart);
+window.addEventListener('mousemove', handleJoyMove);
+window.addEventListener('mouseup', handleJoyEnd);
+joyZone.addEventListener('touchstart', handleJoyStart, {passive: false});
+window.addEventListener('touchmove', handleJoyMove, {passive: false});
+window.addEventListener('touchend', handleJoyEnd);
+
+// --- COMBAT SYSTEM ---
 function startBattle() {
-    gameEngine.currentState = GAME_STATES.BATTLING;
-    // Wild pal level scales with zone
-    const wildLevel = state.zone + rand(0, 2);
-    gameEngine.wildPal = generatePal(wildLevel);
-    gameEngine.battleTimer = 0;
+    engine.state = STATES.BATTLING;
+    engine.battleCooldown = false;
+    engine.joystick.active = false; joyBase.classList.add('hidden');
+    
+    let active = state.pals[state.activePalIndex];
+    let wildLevel = Math.max(1, active.level + Math.floor(Math.random()*3 - 1));
+    engine.wildPal = generatePal(wildLevel);
     
     document.getElementById('battle-ui').classList.remove('hidden');
     updateBattleUI();
-    logAction(`Wild ${gameEngine.wildPal.name} appeared!`);
+    logAction(`A wild ${engine.wildPal.name} leaps from the grass!`);
 }
 
-function endBattle(won) {
-    document.getElementById('battle-ui').classList.add('hidden');
-    
-    if (won) {
-        const active = state.pals[state.activePalIndex];
-        const xpGain = Math.floor(20 * Math.pow(1.15, gameEngine.wildPal.level));
-        const baseGold = 10 * Math.pow(1.1, state.zone);
-        const goldGain = Math.floor(baseGold * (1 + state.badges * 0.5)); // Badges give +50% gold each
-        
-        active.exp += xpGain;
-        state.gold += goldGain;
-        logAction(`Won! Gained ${goldGain}G & ${xpGain}XP.`);
-        checkLevelUp(active);
+function processTurn(action) {
+    if(engine.battleCooldown || engine.state !== STATES.BATTLING) return;
+    engine.battleCooldown = true;
+    let active = state.pals[state.activePalIndex];
+    let wild = engine.wildPal;
 
-        // Catch logic
-        const baseCatchChance = 0.1 + (state.upgrades.catchRate * 0.05); // max ~ 1.0 depending on upgrades
-        if (Math.random() < baseCatchChance) {
-            if (state.pals.length < 20) {
-                gameEngine.wildPal.hp = gameEngine.wildPal.maxHp; // Heal on catch
-                state.pals.push(gameEngine.wildPal);
-                logAction(`Caught ${gameEngine.wildPal.name}!`);
+    if(action === 'run') {
+        logAction("Got away safely!");
+        endBattle(false);
+        return;
+    }
+
+    if(action === 'catch') {
+        let chance = 0.2 + (state.upgrades.catchRate * 0.05);
+        if(Math.random() < chance) {
+            wild.hp = wild.maxHp;
+            if(state.pals.length < 20) {
+                state.pals.push(wild);
+                logAction(`Caught ${wild.name}!`);
             } else {
-                logAction(`Pal Box full! Released ${gameEngine.wildPal.name} for 50G.`);
-                state.gold += 50;
+                state.gold += 100;
+                logAction(`Box full! Sold ${wild.name} for 100G.`);
+            }
+            spawnParticles(450, 200, '#FFCA28', 20);
+            setTimeout(() => endBattle(true, false), 1000);
+            return;
+        } else {
+            addFloatingText(450, 150, "Broke free!", '#fff');
+        }
+    }
+
+    if(action === 'attack') {
+        // Player attacks
+        spawnParticles(450, 200, TYPES[active.type].color, 10);
+        let mult = TYPES[active.type].strong === wild.type ? 1.5 : TYPES[active.type].weak === wild.type ? 0.5 : 1;
+        let dmg = Math.max(1, Math.floor((active.atk * mult) - (wild.def * 0.5)));
+        wild.hp -= dmg;
+        addFloatingText(450, 180, `-${dmg}`, mult > 1 ? '#FFCA28' : '#fff');
+        
+        if(wild.hp <= 0) {
+            wild.hp = 0; updateBattleUI();
+            setTimeout(() => endBattle(true, true), 1000);
+            return;
+        }
+    }
+
+    // Enemy attacks back after delay
+    updateBattleUI();
+    setTimeout(() => {
+        spawnParticles(150, 400, TYPES[wild.type].color, 10);
+        let mult = TYPES[wild.type].strong === active.type ? 1.5 : TYPES[wild.type].weak === active.type ? 0.5 : 1;
+        let dmg = Math.max(1, Math.floor((wild.atk * mult) - (active.def * 0.5)));
+        active.hp -= dmg;
+        addFloatingText(150, 380, `-${dmg}`, '#ff0000');
+        
+        if(active.hp <= 0) {
+            active.hp = 0; updateBattleUI();
+            logAction(`${active.name} fainted!`);
+            setTimeout(() => endBattle(false), 1000);
+        } else {
+            updateBattleUI();
+            engine.battleCooldown = false;
+        }
+    }, 800);
+}
+
+function endBattle(won, gaveExp = false) {
+    document.getElementById('battle-ui').classList.add('hidden');
+    if(won && gaveExp) {
+        let active = state.pals[state.activePalIndex];
+        let xpGain = Math.floor(20 * engine.wildPal.level);
+        let goldGain = Math.floor(10 * engine.wildPal.level * (1 + state.badges * 0.5));
+        active.exp += xpGain; state.gold += goldGain;
+        logAction(`Won! +${goldGain}G, +${xpGain}XP`);
+        checkLevelUp(active);
+    }
+    engine.wildPal = null;
+    engine.state = STATES.WANDERING;
+    engine.battleCooldown = false;
+    updateUI(); saveGame();
+}
+
+document.getElementById('btn-attack').onclick = () => processTurn('attack');
+document.getElementById('btn-catch').onclick = () => processTurn('catch');
+document.getElementById('btn-run').onclick = () => processTurn('run');
+
+// --- UPDATE LOOP ---
+function updatePlayer(dt) {
+    let speed = 150 + (state.upgrades.speed * 20);
+    let px = engine.joystick.dx * speed * (dt/1000);
+    let py = engine.joystick.dy * speed * (dt/1000);
+    
+    if(px !== 0 || py !== 0) {
+        let newX = engine.player.x + px/TILE_SIZE;
+        let newY = engine.player.y + py/TILE_SIZE;
+        
+        // Collision (Circle-to-Grid rough check)
+        let r = 0.3; // player radius in tiles
+        if(getTile(Math.floor(newX+r), Math.floor(engine.player.y)) !== 2 && getTile(Math.floor(newX+r), Math.floor(engine.player.y)) !== 3 &&
+           getTile(Math.floor(newX-r), Math.floor(engine.player.y)) !== 2 && getTile(Math.floor(newX-r), Math.floor(engine.player.y)) !== 3) {
+            engine.player.x = newX;
+        }
+        if(getTile(Math.floor(engine.player.x), Math.floor(newY+r)) !== 2 && getTile(Math.floor(engine.player.x), Math.floor(newY+r)) !== 3 &&
+           getTile(Math.floor(engine.player.x), Math.floor(newY-r)) !== 2 && getTile(Math.floor(engine.player.x), Math.floor(newY-r)) !== 3) {
+            engine.player.y = newY;
+        }
+        
+        // Items & Encounters
+        let tx = Math.floor(engine.player.x), ty = Math.floor(engine.player.y);
+        checkTileItem(tx, ty);
+        
+        if(getTile(tx, ty) === 1) { // In Grass
+            if(Math.random() < 0.05 * (dt/1000)) spawnParticles(300, 300, '#81C784', 1); // Grass rustle
+            if(state.pals[state.activePalIndex].hp > 0 && Math.random() < 0.25 * (dt/1000)) {
+                startBattle();
             }
         }
-
-        // Zone Progression
-        state.killsInZone++;
-        if (state.killsInZone >= 10) {
-            state.zone++;
-            state.killsInZone = 0;
-            logAction(`Advanced to Zone ${state.zone}!`);
-            generateMap(); // Regenerate map to simulate moving to a new route
-        }
-    } else {
-        logAction(`Your Pal fainted! Resting...`);
     }
-
-    gameEngine.wildPal = null;
-    gameEngine.currentState = GAME_STATES.WANDERING;
-    updateUI();
-    saveGame();
-}
-
-function battleTick(dt) {
-    gameEngine.battleTimer += dt;
-    // Attack every 1 second
-    if (gameEngine.battleTimer > 1000) {
-        gameEngine.battleTimer = 0;
-        const active = state.pals[state.activePalIndex];
-        const wild = gameEngine.wildPal;
-
-        // Player attacks wild
-        let pAtk = getDamage(active, wild);
-        wild.hp -= pAtk.dmg;
-        addFloatingText(350, 200, `-${pAtk.dmg}`, pAtk.typeMult > 1 ? '#ffcc00' : '#fff');
-        
-        if (wild.hp <= 0) {
-            wild.hp = 0;
-            updateBattleUI();
-            setTimeout(() => endBattle(true), 500);
-            return;
-        }
-
-        // Wild attacks player
-        let wAtk = getDamage(wild, active);
-        active.hp -= wAtk.dmg;
-        addFloatingText(150, 400, `-${wAtk.dmg}`, '#ff0000');
-
-        if (active.hp <= 0) {
-            active.hp = 0;
-            updateBattleUI();
-            setTimeout(() => endBattle(false), 500);
-            return;
-        }
-
-        updateBattleUI();
-    }
-}
-
-// --- MOVEMENT & ENGINE ---
-function movePlayerTick(dt) {
-    const p = gameEngine.player;
     
-    // Auto-heal while wandering
-    const active = state.pals[state.activePalIndex];
-    if (active.hp < active.maxHp) {
-        const healAmt = (active.maxHp * 0.05) * (1 + state.upgrades.heal * 0.5) * (dt/1000);
-        active.hp += healAmt;
+    // Auto Heal
+    let active = state.pals[state.activePalIndex];
+    if(active.hp > 0 && active.hp < active.maxHp) {
+        active.hp += (active.maxHp * 0.05) * (1 + state.upgrades.heal) * (dt/1000);
         if(active.hp > active.maxHp) active.hp = active.maxHp;
     }
+}
 
-    if (p.moving) {
-        const speed = 100 + (state.upgrades.speed * 20); // Pixels per second
-        const moveDist = (speed * dt) / 1000;
-        p.pixelsToMove -= moveDist;
-
-        if (p.pixelsToMove <= 0) {
-            p.moving = false;
-            p.x = p.targetX;
-            p.y = p.targetY;
-            
-            // Check grass encounter
-            if (gameEngine.map[p.y][p.x] === 1) {
-                if (active.hp > 0 && Math.random() < 0.25) { // 25% chance in grass
-                    startBattle();
-                    return;
-                }
-            }
-        }
-    } else {
-        // Pick new random direction
-        const dirs = [
-            { dx: 0, dy: -1, str: 'up' },
-            { dx: 0, dy: 1, str: 'down' },
-            { dx: -1, dy: 0, str: 'left' },
-            { dx: 1, dy: 0, str: 'right' }
-        ];
-        const validDirs = [];
-        dirs.forEach(d => {
-            const nx = p.x + d.dx;
-            const ny = p.y + d.dy;
-            if (nx >= 0 && nx < MAP_WIDTH && ny >= 0 && ny < MAP_HEIGHT) {
-                if (gameEngine.map[ny][nx] !== 2) { // 2 = obstacle
-                    validDirs.push(d);
-                }
-            }
-        });
-
-        if (validDirs.length > 0) {
-            const pick = validDirs[rand(0, validDirs.length - 1)];
-            p.targetX = p.x + pick.dx;
-            p.targetY = p.y + pick.dy;
-            p.dir = pick.str;
-            p.moving = true;
-            p.pixelsToMove = TILE_SIZE;
-        }
+function updateParticles(dt) {
+    for(let i = engine.particles.length-1; i >= 0; i--) {
+        let p = engine.particles[i];
+        p.x += p.vx * (dt/10); p.y += p.vy * (dt/10);
+        p.life -= dt/1000;
+        if(p.life <= 0) engine.particles.splice(i, 1);
+    }
+    for(let i = engine.floatingTexts.length-1; i >= 0; i--) {
+        let f = engine.floatingTexts[i];
+        f.y -= 20 * (dt/1000); f.life -= dt/1000;
+        if(f.life <= 0) engine.floatingTexts.splice(i, 1);
     }
 }
 
-// --- RENDERER ---
+// --- GRAPHICS & RENDERING ---
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
 
-function renderMap() {
-    // Camera centers on player
-    const p = gameEngine.player;
-    let px = p.x * TILE_SIZE;
-    let py = p.y * TILE_SIZE;
+function drawShadow(x, y, w, h, radius=50) {
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.ellipse(x, y, w, h, 0, 0, Math.PI*2); ctx.fill();
+}
+
+function renderWorld() {
+    engine.camX = engine.player.x * TILE_SIZE - canvas.width/2;
+    engine.camY = engine.player.y * TILE_SIZE - canvas.height/2;
     
-    // Interpolate for smooth movement
-    if (p.moving) {
-        if (p.dir === 'up') py -= (TILE_SIZE - p.pixelsToMove);
-        if (p.dir === 'down') py += (TILE_SIZE - p.pixelsToMove);
-        if (p.dir === 'left') px -= (TILE_SIZE - p.pixelsToMove);
-        if (p.dir === 'right') px += (TILE_SIZE - p.pixelsToMove);
-    }
-
-    const camX = px - (canvas.width / 2) + (TILE_SIZE / 2);
-    const camY = py - (canvas.height / 2) + (TILE_SIZE / 2);
-
-    // Draw Map
-    ctx.fillStyle = '#8bac0f'; // Default BG
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    for (let y = 0; y < MAP_HEIGHT; y++) {
-        for (let x = 0; x < MAP_WIDTH; x++) {
-            const tile = gameEngine.map[y][x];
-            const drawX = (x * TILE_SIZE) - camX;
-            const drawY = (y * TILE_SIZE) - camY;
-
-            if (drawX < -TILE_SIZE || drawX > canvas.width || drawY < -TILE_SIZE || drawY > canvas.height) continue;
-
-            if (tile === 0) {
-                // Path
-                ctx.fillStyle = '#e8d2a5';
-                ctx.fillRect(drawX, drawY, TILE_SIZE, TILE_SIZE);
-            } else if (tile === 1) {
-                // Grass
-                ctx.fillStyle = '#306230';
-                ctx.fillRect(drawX, drawY, TILE_SIZE, TILE_SIZE);
-                // Grass blades decoration
-                ctx.fillStyle = '#0f380f';
-                ctx.fillRect(drawX + 10, drawY + 10, 4, 10);
-                ctx.fillRect(drawX + 25, drawY + 20, 4, 10);
-            } else if (tile === 2) {
-                // Tree
-                ctx.fillStyle = '#0f380f';
-                ctx.beginPath();
-                ctx.arc(drawX + TILE_SIZE/2, drawY + TILE_SIZE/2, TILE_SIZE/2 - 2, 0, Math.PI*2);
-                ctx.fill();
+    let startTX = Math.floor(engine.camX / TILE_SIZE) - 1;
+    let startTY = Math.floor(engine.camY / TILE_SIZE) - 1;
+    let endTX = startTX + Math.ceil(canvas.width / TILE_SIZE) + 2;
+    let endTY = startTY + Math.ceil(canvas.height / TILE_SIZE) + 2;
+    
+    ctx.fillStyle = '#1e1e24'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    
+    // Draw Base Terrain (Path, Grass, Water)
+    for(let y=startTY; y<=endTY; y++) {
+        for(let x=startTX; x<=endTX; x++) {
+            let t = getTile(x, y);
+            let drawX = x * TILE_SIZE - engine.camX;
+            let drawY = y * TILE_SIZE - engine.camY;
+            
+            if(t===0) { ctx.fillStyle = '#E6C280'; ctx.fillRect(drawX, drawY, TILE_SIZE+1, TILE_SIZE+1); } // Path
+            else if(t===1) { // Grass
+                ctx.fillStyle = '#66BB6A'; ctx.fillRect(drawX, drawY, TILE_SIZE+1, TILE_SIZE+1);
+                ctx.fillStyle = '#43A047'; ctx.fillRect(drawX+10, drawY+10, 4, 8); ctx.fillRect(drawX+30, drawY+25, 4, 8);
+            }
+            else if(t===2) { // Water
+                ctx.fillStyle = '#42A5F5'; ctx.fillRect(drawX, drawY, TILE_SIZE+1, TILE_SIZE+1);
+                let waveOffset = Math.sin(engine.time/300 + x + y)*5;
+                ctx.fillStyle = 'rgba(255,255,255,0.3)';
+                ctx.fillRect(drawX+10, drawY+20+waveOffset, 20, 3);
             }
         }
     }
+    
+    // Draw Items
+    engine.itemsMap.forEach((item, key) => {
+        if(item.type === 'stone' && !item.collected) {
+            let [tx, ty] = key.split(',').map(Number);
+            let dx = tx * TILE_SIZE - engine.camX + TILE_SIZE/2;
+            let dy = ty * TILE_SIZE - engine.camY + TILE_SIZE/2 + Math.sin(engine.time/200)*3;
+            if(dx > -50 && dx < 650 && dy > -50 && dy < 650) {
+                drawShadow(dx, dy+15, 10, 4);
+                ctx.fillStyle = '#E040FB'; ctx.beginPath(); ctx.moveTo(dx, dy-10); ctx.lineTo(dx+8, dy); ctx.lineTo(dx, dy+10); ctx.lineTo(dx-8, dy); ctx.fill();
+            }
+        }
+    });
 
     // Draw Player
-    const playerScreenX = (px) - camX;
-    const playerScreenY = (py) - camY;
-    
-    // Player Shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.3)';
-    ctx.beginPath();
-    ctx.ellipse(playerScreenX + TILE_SIZE/2, playerScreenY + TILE_SIZE - 5, 12, 6, 0, 0, Math.PI*2);
-    ctx.fill();
+    let px = canvas.width/2; let py = canvas.height/2;
+    drawShadow(px, py+20, 15, 6);
+    ctx.fillStyle = '#f44336'; ctx.beginPath(); ctx.roundRect(px-12, py-15 + Math.sin(engine.time/150)*2, 24, 30, 8); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillRect(px-8, py-5 + Math.sin(engine.time/150)*2, 16, 8); // Visor
 
-    // Player Sprite (Placeholder red cap boy)
-    ctx.fillStyle = '#ff0000'; // Hat
-    ctx.fillRect(playerScreenX + 10, playerScreenY + 5, 20, 10);
-    ctx.fillStyle = '#ffccaa'; // Face
-    ctx.fillRect(playerScreenX + 10, playerScreenY + 15, 20, 10);
-    ctx.fillStyle = '#4444ff'; // Body
-    ctx.fillRect(playerScreenX + 8, playerScreenY + 25, 24, 15);
+    // Draw Trees (on top for faux depth)
+    for(let y=startTY; y<=endTY; y++) {
+        for(let x=startTX; x<=endTX; x++) {
+            if(getTile(x, y) === 3) {
+                let drawX = x * TILE_SIZE - engine.camX + TILE_SIZE/2;
+                let drawY = y * TILE_SIZE - engine.camY + TILE_SIZE/2;
+                drawShadow(drawX, drawY+20, 20, 8);
+                ctx.fillStyle = '#2E7D32';
+                ctx.beginPath(); ctx.arc(drawX, drawY-10, 25, 0, Math.PI*2); ctx.fill();
+                ctx.beginPath(); ctx.arc(drawX-10, drawY+5, 20, 0, Math.PI*2); ctx.fill();
+                ctx.beginPath(); ctx.arc(drawX+10, drawY+5, 20, 0, Math.PI*2); ctx.fill();
+            }
+        }
+    }
 }
 
 function renderBattle() {
-    // Battle Background
-    ctx.fillStyle = '#8bac0f';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#1e1e24'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    
+    // Diagonal background split
+    ctx.fillStyle = '#2E7D32'; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(600,0); ctx.lineTo(0,400); ctx.fill();
     
     // Platforms
-    ctx.fillStyle = '#306230';
-    ctx.beginPath(); ctx.ellipse(450, 200, 100, 30, 0, 0, Math.PI*2); ctx.fill(); // Enemy Platform
-    ctx.beginPath(); ctx.ellipse(150, 400, 120, 40, 0, 0, Math.PI*2); ctx.fill(); // Player Platform
+    drawShadow(450, 250, 80, 20); // Enemy
+    drawShadow(150, 450, 100, 25); // Player
 
-    const active = state.pals[state.activePalIndex];
-    const wild = gameEngine.wildPal;
+    let active = state.pals[state.activePalIndex];
+    let wild = engine.wildPal;
+    let breath = Math.sin(engine.time/300) * 5;
 
-    // Draw Wild Pal (Top Right) - Color based on type
-    ctx.fillStyle = TYPE_COLORS[wild.type];
-    ctx.fillRect(400, 100, 100, 100);
-    ctx.fillStyle = '#000'; // Eyes
-    ctx.fillRect(420, 120, 10, 10);
-    ctx.fillRect(470, 120, 10, 10);
+    // Draw Enemy
+    ctx.fillStyle = TYPES[wild.type].color;
+    ctx.beginPath(); ctx.roundRect(400, 150 - breath, 100, 100 + breath, 15); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(430, 180 - breath, 8, 0, Math.PI*2); ctx.arc(470, 180 - breath, 8, 0, Math.PI*2); ctx.fill();
 
-    // Draw Player Pal (Bottom Left)
-    ctx.fillStyle = TYPE_COLORS[active.type];
-    ctx.fillRect(100, 280, 100, 100);
-    ctx.fillStyle = '#000'; // Eyes (facing right)
-    ctx.fillRect(160, 300, 10, 10);
-    ctx.fillRect(180, 300, 10, 10);
+    // Draw Player Pal
+    ctx.fillStyle = TYPES[active.type].color;
+    ctx.beginPath(); ctx.roundRect(100, 330 - breath, 100, 100 + breath, 15); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(170, 360 - breath, 8, 0, Math.PI*2); ctx.fill(); // looking right
 }
 
-function renderFloatingTexts(dt) {
-    ctx.font = "16px 'Press Start 2P', monospace";
-    ctx.textAlign = "center";
-    for (let i = gameEngine.floatingTexts.length - 1; i >= 0; i--) {
-        let ft = gameEngine.floatingTexts[i];
-        ft.life -= dt / 1000;
-        ft.y -= (20 * dt) / 1000; // Float up
-        
-        ctx.fillStyle = ft.color;
-        ctx.globalAlpha = Math.max(0, ft.life);
-        ctx.fillText(ft.text, ft.x, ft.y);
-        ctx.globalAlpha = 1.0;
+function renderOverlay() {
+    ctx.font = "14px 'Press Start 2P'"; ctx.textAlign = "center";
+    engine.floatingTexts.forEach(ft => {
+        ctx.fillStyle = ft.color; ctx.globalAlpha = Math.max(0, ft.life);
+        ctx.fillText(ft.text, ft.x, ft.y); ctx.globalAlpha = 1.0;
+    });
 
-        if (ft.life <= 0) gameEngine.floatingTexts.splice(i, 1);
-    }
-}
-
-// --- GAME LOOP ---
-let lastTime = 0;
-function loop(time) {
-    const dt = time - lastTime;
-    lastTime = time;
-
-    // Update Logic
-    if (gameEngine.currentState === GAME_STATES.WANDERING) {
-        movePlayerTick(dt);
-        renderMap();
-    } else if (gameEngine.currentState === GAME_STATES.BATTLING) {
-        battleTick(dt);
-        renderBattle();
-    }
-
-    renderFloatingTexts(dt);
-    
-    requestAnimationFrame(loop);
-}
-
-// --- UI UPDATES & EVENT LISTENERS ---
-function updateUI() {
-    document.getElementById('current-zone').innerText = state.zone;
-    document.getElementById('gold-amount').innerText = state.gold;
-    document.getElementById('badge-amount').innerText = state.badges;
-    
-    // Prestige tab
-    const potentialBadges = state.zone >= 10 ? Math.floor(state.zone / 5) : 0;
-    document.getElementById('pending-badges').innerText = potentialBadges;
-
-    // Upgrades
-    const upg = state.upgrades;
-    document.getElementById('upg-catch-lvl').innerText = upg.catchRate;
-    document.getElementById('upg-catch-cost').innerText = getCost(10, upg.catchRate, 1.5);
-    
-    document.getElementById('upg-speed-lvl').innerText = upg.speed;
-    document.getElementById('upg-speed-cost').innerText = getCost(50, upg.speed, 2.0);
-    
-    document.getElementById('upg-heal-lvl').innerText = upg.heal;
-    document.getElementById('upg-heal-cost').innerText = getCost(100, upg.heal, 1.8);
-
-    renderPals();
-}
-
-function updateBattleUI() {
-    if (gameEngine.currentState !== GAME_STATES.BATTLING || !gameEngine.wildPal) return;
-    const active = state.pals[state.activePalIndex];
-    const wild = gameEngine.wildPal;
-
-    document.getElementById('player-name').innerText = `${active.name} Lv.${active.level}`;
-    document.getElementById('enemy-name').innerText = `Wild ${wild.name} Lv.${wild.level}`;
-
-    const pPct = Math.max(0, (active.hp / active.maxHp) * 100);
-    const ePct = Math.max(0, (wild.hp / wild.maxHp) * 100);
-
-    const pBar = document.getElementById('player-hp-bar');
-    const eBar = document.getElementById('enemy-hp-bar');
-    
-    pBar.style.width = `${pPct}%`;
-    eBar.style.width = `${ePct}%`;
-
-    // Change colors based on health
-    pBar.style.backgroundColor = pPct > 50 ? '#00ff00' : pPct > 20 ? '#ffff00' : '#ff0000';
-    eBar.style.backgroundColor = ePct > 50 ? '#00ff00' : ePct > 20 ? '#ffff00' : '#ff0000';
-}
-
-function renderPals() {
-    const activeContainer = document.getElementById('active-pal-card');
-    const invContainer = document.getElementById('pal-inventory');
-    
-    activeContainer.innerHTML = '';
-    invContainer.innerHTML = '';
-    document.getElementById('pal-count').innerText = state.pals.length;
-
-    state.pals.forEach((pal, index) => {
-        let hpPct = Math.floor((pal.hp / pal.maxHp) * 100);
-        let xpPct = Math.floor((pal.exp / pal.maxExp) * 100);
-        const cardHtml = `
-            <div class="pal-header">
-                <strong>${pal.name} <span style="color:#aaa;">Lv.${pal.level}</span></strong>
-                <span class="pal-type type-${pal.type.toLowerCase()}">${pal.type}</span>
-            </div>
-            <div class="pal-stats">
-                HP: ${Math.floor(pal.hp)}/${pal.maxHp} (${hpPct}%) | EXP: ${xpPct}% <br>
-                ATK: ${pal.atk} | DEF: ${pal.def}
-            </div>
-        `;
-        
-        let card = document.createElement('div');
-        card.className = `pal-card ${index === state.activePalIndex ? 'active-pal' : ''}`;
-        card.innerHTML = cardHtml;
-        
-        if (index === state.activePalIndex) {
-            activeContainer.appendChild(card);
-        } else {
-            card.onclick = () => {
-                state.activePalIndex = index;
-                updateUI();
-                saveGame();
-            };
-            invContainer.appendChild(card);
-        }
+    engine.particles.forEach(p => {
+        ctx.fillStyle = p.color; ctx.globalAlpha = Math.max(0, p.life);
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha = 1.0;
     });
 }
 
-// Upgrade Buttons
-function buyUpgrade(type, baseCost, mult) {
-    const cost = getCost(baseCost, state.upgrades[type], mult);
-    if (state.gold >= cost) {
-        state.gold -= cost;
-        state.upgrades[type]++;
-        updateUI();
-        saveGame();
+function spawnParticles(x, y, color, count) {
+    for(let i=0; i<count; i++) {
+        engine.particles.push({
+            x: x, y: y, vx: (Math.random()-0.5)*10, vy: (Math.random()-0.5)*10,
+            life: 0.5 + Math.random()*0.5, size: 2+Math.random()*4, color: color
+        });
     }
 }
-document.getElementById('btn-upg-catch').onclick = () => buyUpgrade('catchRate', 10, 1.5);
-document.getElementById('btn-upg-speed').onclick = () => buyUpgrade('speed', 50, 2.0);
-document.getElementById('btn-upg-heal').onclick = () => buyUpgrade('heal', 100, 1.8);
-document.getElementById('btn-prestige').onclick = prestige;
-document.getElementById('btn-hard-reset').onclick = hardReset;
-document.getElementById('btn-claim-offline').onclick = () => {
-    document.getElementById('offline-modal').classList.add('hidden');
-};
-
-// Tabs
-document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.onclick = () => {
-        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-        btn.classList.add('active');
-        document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    };
-});
-
-// Periodic Saving and UI updates
-setInterval(() => {
-    saveGame();
-    updateUI(); // Keep UI fresh for HP regen etc
-}, 1000);
-
-// --- INIT ---
-function init() {
-    generateMap();
-    loadGame();
-    requestAnimationFrame((t) => { lastTime = t; loop(t); });
+function addFloatingText(x, y, text, color) { engine.floatingTexts.push({ x, y, text, color, life: 1.0 }); }
+function logAction(msg) {
+    let div = document.getElementById('action-log');
+    let entry = document.createElement('div'); entry.className = 'log-entry'; entry.innerText = msg;
+    div.prepend(entry); if(div.children.length > 5) div.lastChild.remove();
 }
 
-window.onload = init;
+// --- MAIN LOOP ---
+let lastTime = 0;
+function loop(time) {
+    let dt = time - lastTime; lastTime = time; engine.time = time;
+    
+    if(engine.state === STATES.WANDERING) { updatePlayer(dt); renderWorld(); }
+    else if(engine.state === STATES.BATTLING) renderBattle();
+    
+    updateParticles(dt); renderOverlay();
+    requestAnimationFrame(loop);
+}
+
+// --- UI LOGIC ---
+function updateUI() {
+    document.getElementById('gold-amount').innerText = state.gold;
+    document.getElementById('stone-amount').innerText = state.stones;
+    document.getElementById('pending-badges').innerText = state.maxLevelReached;
+    
+    let u = state.upgrades;
+    document.getElementById('upg-catch-lvl').innerText = u.catchRate;
+    document.getElementById('upg-catch-cost').innerText = Math.floor(10 * Math.pow(1.5, u.catchRate));
+    document.getElementById('upg-speed-lvl').innerText = u.speed;
+    document.getElementById('upg-speed-cost').innerText = Math.floor(50 * Math.pow(2.0, u.speed));
+    document.getElementById('upg-heal-lvl').innerText = u.heal;
+    document.getElementById('upg-heal-cost').innerText = Math.floor(100 * Math.pow(1.8, u.heal));
+
+    const activeBtn = document.getElementById('active-evolve-btn');
+    if(state.stones >= 3 && state.pals[state.activePalIndex].evo < 2) {
+        activeBtn.classList.remove('hidden');
+        activeBtn.onclick = () => evolvePal(state.pals[state.activePalIndex]);
+    } else activeBtn.classList.add('hidden');
+
+    renderPals();
+}
+function updateBattleUI() {
+    if(engine.state !== STATES.BATTLING) return;
+    let active = state.pals[state.activePalIndex], wild = engine.wildPal;
+    document.getElementById('player-name').innerText = `${active.name} Lv.${active.level}`;
+    document.getElementById('enemy-name').innerText = `Wild ${wild.name} Lv.${wild.level}`;
+    document.getElementById('player-hp-bar').style.width = `${Math.max(0, active.hp/active.maxHp*100)}%`;
+    document.getElementById('enemy-hp-bar').style.width = `${Math.max(0, wild.hp/wild.maxHp*100)}%`;
+}
+function renderPals() {
+    let aBox = document.getElementById('active-pal-card'), iBox = document.getElementById('pal-inventory');
+    aBox.innerHTML = ''; iBox.innerHTML = ''; document.getElementById('pal-count').innerText = state.pals.length;
+
+    state.pals.forEach((pal, idx) => {
+        let html = `
+            <div class="pal-header">
+                <span>${pal.name} <span style="font-size:10px;color:var(--text-dim)">Lv.${pal.level}</span></span>
+                <span class="pal-type" style="background:${TYPES[pal.type].color};color:#000;">${pal.type}</span>
+            </div>
+            <div class="pal-stats">HP: ${Math.floor(pal.hp)}/${pal.maxHp} | EXP: ${Math.floor((pal.exp/pal.maxExp)*100)}%<br>ATK: ${pal.atk} | DEF: ${pal.def}</div>
+        `;
+        let div = document.createElement('div'); div.className = `pal-card ${idx===state.activePalIndex?'active-pal':''}`;
+        div.innerHTML = html;
+        if(idx === state.activePalIndex) aBox.appendChild(div);
+        else { div.onclick = () => { state.activePalIndex = idx; updateUI(); saveGame(); }; iBox.appendChild(div); }
+    });
+}
+
+// Sidebar Buttons
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.onclick = () => {
+        document.querySelectorAll('.tab-btn, .tab-content').forEach(el => el.classList.remove('active'));
+        btn.classList.add('active'); document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    };
+});
+function buy(type, base, m) {
+    let cost = Math.floor(base * Math.pow(m, state.upgrades[type]));
+    if(state.gold >= cost) { state.gold -= cost; state.upgrades[type]++; updateUI(); saveGame(); }
+}
+document.getElementById('btn-upg-catch').onclick = () => buy('catchRate', 10, 1.5);
+document.getElementById('btn-upg-speed').onclick = () => buy('speed', 50, 2.0);
+document.getElementById('btn-upg-heal').onclick = () => buy('heal', 100, 1.8);
+
+document.getElementById('btn-prestige').onclick = () => {
+    if(state.maxLevelReached < 10) return alert("Reach Lvl 10 to prestige!");
+    state.badges += state.maxLevelReached;
+    state.gold = 0; state.stones = 0; state.maxLevelReached = 1;
+    state.upgrades = { catchRate:0, speed:0, heal:0 };
+    state.pals = [generatePal(1, true)]; state.activePalIndex = 0;
+    saveGame(); updateUI(); logAction(`Prestiged! Now at ${state.badges} Badges.`);
+};
+document.getElementById('btn-hard-reset').onclick = () => {
+    if(confirm("Delete ALL progress?")) { localStorage.removeItem('idlePalEndless'); location.reload(); }
+};
+document.getElementById('btn-claim-offline').onclick = () => document.getElementById('offline-modal').classList.add('hidden');
+
+setInterval(() => { if(engine.state === STATES.WANDERING) { saveGame(); updateUI(); } }, 2000);
+
+// --- INIT ---
+loadGame();
+requestAnimationFrame(t => { lastTime = t; loop(t); });
